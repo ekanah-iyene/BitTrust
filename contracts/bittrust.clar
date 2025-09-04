@@ -109,3 +109,105 @@
     }))
   )
 )
+
+;; Execute loan request with dynamic terms based on Bitcoin-secured reputation
+(define-public (execute-loan-request
+    (requested-amount uint)
+    (collateral-deposit uint)
+    (loan-duration uint)
+  )
+  (let (
+      (borrower tx-sender)
+      (current-loan-id (var-get loan-counter))
+      (user-profile (unwrap! (map-get? user-profiles { address: borrower }) ERR_NOT_AUTHORIZED))
+      (current-portfolio (default-to { loan-identifiers: (list) }
+        (map-get? borrower-portfolios { borrower: borrower })
+      ))
+    )
+    ;; Comprehensive validation
+    (asserts! (var-get protocol-active) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get credit-score user-profile) LENDING_THRESHOLD)
+      ERR_CREDIT_INSUFFICIENT
+    )
+    (asserts!
+      (< (len (get loan-identifiers current-portfolio)) CONCURRENT_LOAN_LIMIT)
+      ERR_LOAN_LIMIT_REACHED
+    )
+    (asserts!
+      (and
+        (>= requested-amount MIN_LOAN_AMOUNT)
+        (> loan-duration u0)
+        (<= loan-duration MAX_LOAN_TERM)
+      )
+      ERR_INVALID_PARAMETERS
+    )
+
+    ;; Dynamic loan term calculation
+    (let (
+        (minimum-collateral (compute-collateral-requirement requested-amount
+          (get credit-score user-profile)
+        ))
+        (personalized-rate (compute-interest-rate (get credit-score user-profile)))
+      )
+      (asserts! (>= collateral-deposit minimum-collateral)
+        ERR_INSUFFICIENT_BALANCE
+      )
+
+      ;; Secure collateral in protocol vault
+      (try! (stx-transfer? collateral-deposit borrower (as-contract tx-sender)))
+
+      ;; Register loan in protocol
+      (map-set active-loans { loan-id: current-loan-id } {
+        borrower-address: borrower,
+        loan-principal: requested-amount,
+        collateral-amount: collateral-deposit,
+        due-block: (+ stacks-block-height loan-duration),
+        applied-rate: personalized-rate,
+        repayment-progress: u0,
+        loan-state: "active",
+        origination-block: stacks-block-height,
+      })
+
+      ;; Update borrower portfolio
+      (map-set borrower-portfolios { borrower: borrower } { loan-identifiers: (unwrap!
+        (as-max-len?
+          (append (get loan-identifiers current-portfolio) current-loan-id) u5
+        )
+        ERR_LOAN_LIMIT_REACHED
+      ) }
+      )
+
+      ;; Transfer approved amount to borrower
+      (as-contract (try! (stx-transfer? requested-amount tx-sender borrower)))
+
+      ;; Update protocol metrics
+      (var-set loan-counter (+ current-loan-id u1))
+      (var-set protocol-tvl (+ (var-get protocol-tvl) collateral-deposit))
+      (var-set total-loans-originated (+ (var-get total-loans-originated) u1))
+
+      (ok current-loan-id)
+    )
+  )
+)
+
+;; Process loan repayment with Bitcoin-secured credit score updates
+(define-public (process-repayment
+    (loan-identifier uint)
+    (payment-amount uint)
+  )
+  (let (
+      (borrower tx-sender)
+      (loan-data (unwrap! (map-get? active-loans { loan-id: loan-identifier })
+        ERR_LOAN_NOT_FOUND
+      ))
+    )
+    (asserts! (is-eq borrower (get borrower-address loan-data))
+      ERR_NOT_AUTHORIZED
+    )
+    (asserts! (is-eq (get loan-state loan-data) "active") ERR_LOAN_EXPIRED)
+    (asserts! (> payment-amount u0) ERR_INVALID_PARAMETERS)
+
+    ;; Calculate total obligation
+    (let ((total-obligation (+ (get loan-principal loan-data) (calculate-interest-due loan-data))))
+      ;; Process payment transaction
+      (try! (stx-transfer? payment-amount borrower (as-contract tx-sender)))
