@@ -316,3 +316,125 @@
           (+ (get credit-score current-profile) reputation-delta)
           MAXIMUM_CREDIT_SCORE
         )
+        (if (>= (- (get credit-score current-profile) reputation-delta)
+            INITIAL_CREDIT_SCORE
+          )
+          (- (get credit-score current-profile) reputation-delta)
+          INITIAL_CREDIT_SCORE
+        )
+      ))
+    )
+    (ok (map-set user-profiles { address: user-address }
+      (merge current-profile {
+        credit-score: updated-score,
+        total-volume-repaid: (if payment-success
+          (+ (get total-volume-repaid current-profile)
+            (get loan-principal loan-record)
+          )
+          (get total-volume-repaid current-profile)
+        ),
+        completed-loans: (if payment-success
+          (+ (get completed-loans current-profile) u1)
+          (get completed-loans current-profile)
+        ),
+        failed-loans: (if payment-success
+          (get failed-loans current-profile)
+          (+ (get failed-loans current-profile) u1)
+        ),
+        last-interaction: stacks-block-height,
+      })
+    ))
+  )
+)
+
+;; PUBLIC QUERY INTERFACE
+
+;; Retrieve comprehensive user credit profile
+(define-read-only (get-user-profile (user-address principal))
+  (map-get? user-profiles { address: user-address })
+)
+
+;; Get detailed loan information
+(define-read-only (get-loan-information (loan-identifier uint))
+  (map-get? active-loans { loan-id: loan-identifier })
+)
+
+;; Retrieve user's loan portfolio
+(define-read-only (get-borrower-portfolio (borrower-address principal))
+  (map-get? borrower-portfolios { borrower: borrower-address })
+)
+
+;; Protocol health and analytics
+(define-read-only (get-protocol-analytics)
+  {
+    total-value-locked: (var-get protocol-tvl),
+    loans-originated: (var-get total-loans-originated),
+    next-loan-id: (var-get loan-counter),
+    protocol-status: (var-get protocol-active),
+  }
+)
+
+;; Preview loan eligibility and terms
+(define-read-only (preview-loan-eligibility
+    (user-address principal)
+    (amount uint)
+  )
+  (match (map-get? user-profiles { address: user-address })
+    profile (if (>= (get credit-score profile) LENDING_THRESHOLD)
+      (ok {
+        eligible: true,
+        collateral-required: (compute-collateral-requirement amount (get credit-score profile)),
+        interest-rate: (compute-interest-rate (get credit-score profile)),
+        maximum-term: MAX_LOAN_TERM,
+      })
+      (ok {
+        eligible: false,
+        collateral-required: u0,
+        interest-rate: u0,
+        maximum-term: u0,
+      })
+    )
+    (err ERR_NOT_AUTHORIZED)
+  )
+)
+
+;; PROTOCOL ADMINISTRATION
+
+;; Handle loan defaults and maintain protocol integrity
+(define-public (handle-loan-default (loan-identifier uint))
+  (let ((loan-record (unwrap! (map-get? active-loans { loan-id: loan-identifier })
+      ERR_LOAN_NOT_FOUND
+    )))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    ;; Validate loan identifier bounds
+    (asserts!
+      (and (> loan-identifier u0) (< loan-identifier (var-get loan-counter)))
+      ERR_LOAN_NOT_FOUND
+    )
+    (asserts! (>= stacks-block-height (get due-block loan-record))
+      ERR_REPAYMENT_NOT_DUE
+    )
+    (asserts! (is-eq (get loan-state loan-record) "active") ERR_LOAN_EXPIRED)
+
+    ;; Mark loan as defaulted
+    (map-set active-loans { loan-id: loan-identifier }
+      (merge loan-record { loan-state: "defaulted" })
+    )
+
+    ;; Apply reputation penalty
+    (try! (update-credit-reputation (get borrower-address loan-record) false
+      loan-record
+    ))
+
+    (ok true)
+  )
+)
+
+;; Emergency protocol controls
+(define-public (toggle-protocol-status)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set protocol-active (not (var-get protocol-active)))
+    (ok (var-get protocol-active))
+  )
+)
