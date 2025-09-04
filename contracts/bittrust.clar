@@ -211,3 +211,108 @@
     (let ((total-obligation (+ (get loan-principal loan-data) (calculate-interest-due loan-data))))
       ;; Process payment transaction
       (try! (stx-transfer? payment-amount borrower (as-contract tx-sender)))
+
+      (let ((updated-repayment (+ (get repayment-progress loan-data) payment-amount)))
+        ;; Update loan record
+        (map-set active-loans { loan-id: loan-identifier }
+          (merge loan-data {
+            repayment-progress: updated-repayment,
+            loan-state: (if (>= updated-repayment total-obligation)
+              "completed"
+              "active"
+            ),
+          })
+        )
+
+        ;; Handle loan completion
+        (if (>= updated-repayment total-obligation)
+          (begin
+            (try! (update-credit-reputation borrower true loan-data))
+            (as-contract (try! (stx-transfer? (get collateral-amount loan-data) tx-sender borrower)))
+            (var-set protocol-tvl
+              (- (var-get protocol-tvl) (get collateral-amount loan-data))
+            )
+          )
+          true
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; ALGORITHMIC CREDIT ENGINE
+
+;; Dynamic collateral calculation based on Bitcoin-secured trust score
+(define-private (compute-collateral-requirement
+    (loan-amount uint)
+    (trust-score uint)
+  )
+  (let ((collateral-multiplier (- COLLATERAL_CEILING
+      (/ (* (- trust-score INITIAL_CREDIT_SCORE) u40)
+        (- MAXIMUM_CREDIT_SCORE INITIAL_CREDIT_SCORE)
+      ))))
+    (/ (* loan-amount collateral-multiplier) u100)
+  )
+)
+
+;; Personalized interest rate engine
+(define-private (compute-interest-rate (trust-score uint))
+  (let ((rate-discount (/ (* (- trust-score INITIAL_CREDIT_SCORE) u500)
+      (- MAXIMUM_CREDIT_SCORE INITIAL_CREDIT_SCORE)
+    )))
+    (if (>= BASE_APR rate-discount)
+      (- BASE_APR rate-discount)
+      u500
+    )
+  )
+  ;; 5% floor rate
+)
+
+;; Interest calculation for loan obligations
+(define-private (calculate-interest-due (loan-record {
+  borrower-address: principal,
+  loan-principal: uint,
+  collateral-amount: uint,
+  due-block: uint,
+  applied-rate: uint,
+  repayment-progress: uint,
+  loan-state: (string-ascii 20),
+  origination-block: uint,
+}))
+  (/ (* (get loan-principal loan-record) (get applied-rate loan-record)) u10000)
+)
+
+;; Advanced reputation scoring algorithm secured by Bitcoin
+(define-private (update-credit-reputation
+    (user-address principal)
+    (payment-success bool)
+    (loan-record {
+      borrower-address: principal,
+      loan-principal: uint,
+      collateral-amount: uint,
+      due-block: uint,
+      applied-rate: uint,
+      repayment-progress: uint,
+      loan-state: (string-ascii 20),
+      origination-block: uint,
+    })
+  )
+  (let (
+      (current-profile (unwrap! (map-get? user-profiles { address: user-address })
+        ERR_NOT_AUTHORIZED
+      ))
+      (reputation-delta (if payment-success
+        (if (<= (get loan-principal loan-record) u1000000)
+          u20
+          u35
+        )
+        u60
+      ))
+      (updated-score (if payment-success
+        (if (<= (+ (get credit-score current-profile) reputation-delta)
+            MAXIMUM_CREDIT_SCORE
+          )
+          (+ (get credit-score current-profile) reputation-delta)
+          MAXIMUM_CREDIT_SCORE
+        )
